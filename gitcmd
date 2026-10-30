@@ -1,0 +1,1286 @@
+#!/usr/bin/env bash
+# gitcmd - interactive git helper (macOS / Linux) - IMPROVED VERSION
+# Install: chmod +x gitcmd && sudo mv gitcmd /usr/local/bin/gitcmd
+# Run: gitcmd
+set -euo pipefail
+
+# ---------------- UI helpers ----------------
+COLOR="${COLOR:-1}"
+if [[ "${COLOR}" == "1" ]] && [[ -t 1 ]]; then
+  C_BOLD=$'\033[1m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'; C_BLU=$'\033[34m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
+else
+  C_BOLD=""; C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_DIM=""; C_RST=""
+fi
+info(){ echo "${C_BLU}[i]${C_RST} $*"; }
+ok(){   echo "${C_GRN}[ok]${C_RST} $*"; }
+warn(){ echo "${C_YLW}[!]${C_RST} $*"; }
+err(){  echo "${C_RED}[x]${C_RST} $*" >&2; }
+
+pause(){ read -r -p "Press Enter to continue... " _; }
+
+confirm() {
+  local prompt="${1:-Are you sure?}"
+  while true; do
+    read -r -p "$prompt [y/N]: " ans
+    ans="${ans:-N}"
+    case "$ans" in
+      y|Y|yes|YES) return 0;;
+      n|N|no|NO|"") return 1;;
+      *) echo "Please enter y or n.";;
+    esac
+  done
+}
+
+confirm_yes() {
+  local prompt="${1:-Execute?}"
+  while true; do
+    read -r -p "$prompt [Y/n]: " ans
+    ans="${ans:-Y}"
+    case "$ans" in
+      y|Y|yes|YES) return 0;;
+      n|N|no|NO) return 1;;
+      *) echo "Please enter y or n.";;
+    esac
+  done
+}
+
+require_git_repo() {
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    err "Not inside a git repository."
+    exit 1
+  fi
+}
+
+require_clean_worktree_or_confirm() {
+  # Return 0 if clean or user wants to proceed.
+  local dirty
+  dirty="$(git status --porcelain 2>/dev/null | sed '/^$/d' || true)"
+  if [[ -n "$dirty" ]]; then
+    warn "Working tree is NOT clean:"
+    echo "$dirty" | sed 's/^/  /'
+    confirm "Proceed anyway?" || return 1
+  fi
+  return 0
+}
+
+print_help() {
+  cat <<'EOF'
+gitcmd - 交互式 Git 命令向导（macOS / Linux）
+
+目标：避免手敲一行行 git 命令，通过菜单选择参数并确认后执行。
+
+包含：
+- checkout/switch（可选本地/远程分支；远程会引导创建 tracking 分支）
+- merge / rebase（完成后可提示删除源分支：本地/远程）
+- pull / push / fetch / status / log / diff
+- 删除分支：本地/远程/本地+远程
+- 删除文件：一般删除（git rm）/ 彻底删除（从历史清除，需要 git-filter-repo）
+- stash / tag / reset / clean（危险）
+
+技巧：
+- export DRY_RUN=1 只预览命令不执行
+- 在任何选择里输入 q 返回/取消
+EOF
+}
+
+# ---------------- selection helpers ----------------
+choose_one() {
+  local title="$1"; shift
+  local -a items=("$@")
+  if [[ ${#items[@]} -eq 0 ]]; then
+    echo ""
+    return 0
+  fi
+  echo "${C_BOLD}${title}${C_RST}" >&2
+  local i
+  for i in "${!items[@]}"; do
+    printf "  %2d) %s\n" "$((i+1))" "${items[$i]}" >&2
+  done
+  echo "   q) back/quit" >&2
+  while true; do
+    read -r -p "Choose: " choice
+    case "$choice" in
+      q|Q) echo ""; return 1;;
+      '' ) ;;
+      * )
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#items[@]} )); then
+          echo "${items[$((choice-1))]}"
+          return 0
+        fi
+        echo "Invalid choice." >&2
+      ;;
+    esac
+  done
+}
+
+choose_multi_flags() {
+  local title="$1"; shift
+  local -a items=("$@")
+  local -a selected=()
+  if [[ ${#items[@]} -eq 0 ]]; then
+    echo ""
+    return 0
+  fi
+  echo "${C_BOLD}${title}${C_RST}" >&2
+  local i
+  for i in "${!items[@]}"; do
+    printf "  %2d) %s\n" "$((i+1))" "${items[$i]}" >&2
+  done
+  echo "Enter numbers separated by space (or empty for none), q to cancel" >&2
+  while true; do
+    read -r -p "Flags: " line
+    case "$line" in
+      q|Q) echo ""; return 1;;
+      '' ) echo ""; return 0;;
+    esac
+    selected=()
+    local token
+    local ok_all=1
+    for token in $line; do
+      if [[ "$token" =~ ^[0-9]+$ ]] && (( token>=1 && token<=${#items[@]} )); then
+        selected+=("${items[$((token-1))]}")
+      else
+        ok_all=0
+        break
+      fi
+    done
+    if (( ok_all==1 )); then
+      printf "%s " "${selected[@]}"
+      echo ""
+      return 0
+    else
+      echo "Invalid input." >&2
+    fi
+  done
+}
+
+# ---------------- git data helpers ----------------
+current_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || true
+}
+
+list_local_branches() {
+  git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null | sed '/^$/d' || true
+}
+
+list_remote_branches_full() {
+  # e.g. origin/main origin/feature
+  git for-each-ref --format='%(refname:short)' refs/remotes 2>/dev/null \
+    | sed '/^origin\/HEAD$/d' | sed '/^$/d' || true
+}
+
+list_remotes() {
+  git remote 2>/dev/null | sed '/^$/d' || true
+}
+
+list_tags() {
+  git tag --list 2>/dev/null | sed '/^$/d' || true
+}
+
+list_stashes() {
+  git stash list 2>/dev/null | sed '/^$/d' || true
+}
+
+list_untracked_files() {
+  git ls-files --others --exclude-standard 2>/dev/null | sed '/^$/d' || true
+}
+
+list_tracked_files() {
+  git ls-files 2>/dev/null | sed '/^$/d' || true
+}
+
+list_recent_commits() {
+  # Get last 20 commits in format: "hash message"
+  git log --oneline -20 2>/dev/null | sed 's/^\([a-f0-9]\+\) /[\1] /' || true
+}
+
+list_all_refs() {
+  # List all branches, tags, and recent commits for selection
+  {
+    echo "=== LOCAL BRANCHES ==="
+    list_local_branches | sed 's/^/branch: /'
+    echo ""
+    echo "=== REMOTE BRANCHES ==="
+    list_remote_branches_full | sed 's/^/remote: /'
+    echo ""
+    echo "=== TAGS ==="
+    list_tags | sed 's/^/tag: /'
+    echo ""
+    echo "=== RECENT COMMITS ==="
+    list_recent_commits
+  } | sed '/^$/d'
+}
+
+# ---------------- exec wrapper ----------------
+DRY_RUN="${DRY_RUN:-0}"
+
+run_cmd() {
+  local cmd="$*"
+  echo ""
+  echo "${C_BOLD}Command:${C_RST} ${C_YLW}${cmd}${C_RST}"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    warn "DRY_RUN=1 -> not executing."
+    return 0
+  fi
+  if confirm "Execute?"; then
+    eval "$cmd"
+    ok "Done."
+  else
+    warn "Cancelled."
+  fi
+}
+
+run_cmd_yes() {
+  local cmd="$*"
+  echo ""
+  echo "${C_BOLD}Command:${C_RST} ${C_YLW}${cmd}${C_RST}"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    warn "DRY_RUN=1 -> not executing."
+    return 0
+  fi
+  if confirm_yes "Execute?"; then
+    eval "$cmd"
+    ok "Done."
+  else
+    warn "Cancelled."
+  fi
+}
+
+# ---------------- post actions helpers ----------------
+post_delete_branch_prompt() {
+  # $1 = branch local name (source branch)
+  local src="${1:-}"
+  [[ -z "$src" ]] && return 0
+
+  # do not offer deleting current branch
+  if [[ "$(current_branch)" == "$src" ]]; then
+    warn "Source branch equals current branch (${src}). Skip delete prompt."
+    return 0
+  fi
+
+  if ! confirm "Delete merged/rebased branch '${src}'?"; then
+    return 0
+  fi
+
+  # local delete
+  if git show-ref --verify --quiet "refs/heads/${src}"; then
+    local delmode
+    delmode="$(choose_one "Delete local branch '${src}' with:" "-d (safe)" "-D (force)")" || true
+    if [[ "$delmode" == "-D (force)" ]]; then
+      run_cmd "git branch -D \"${src}\""
+    else
+      run_cmd "git branch -d \"${src}\""
+    fi
+  else
+    warn "Local branch '${src}' not found, skip local delete."
+  fi
+
+  # remote delete (choose remote if exists)
+  local -a remotes=()
+  while IFS= read -r r; do remotes+=("$r"); done < <(list_remotes)
+  if [[ ${#remotes[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  if confirm "Also delete remote branch '${src}'?"; then
+    local remote
+    remote="$(choose_one "Select remote to delete '${src}' from" "${remotes[@]}")" || return 0
+    [[ -z "$remote" ]] && return 0
+    # only attempt if remote branch seems to exist (best effort)
+    if git show-ref --verify --quiet "refs/remotes/${remote}/${src}"; then
+      run_cmd "git push \"${remote}\" --delete \"${src}\""
+    else
+      warn "Remote branch '${remote}/${src}' not found locally (maybe not fetched). Still can attempt delete."
+      if confirm "Attempt remote delete anyway?"; then
+        run_cmd "git push \"${remote}\" --delete \"${src}\""
+      fi
+    fi
+  fi
+}
+
+# ---------------- workflows ----------------
+wf_status() { run_cmd_yes "git status"; }
+
+wf_fetch() {
+  local -a remotes=()
+  while IFS= read -r r; do remotes+=("$r"); done < <(list_remotes)
+  if [[ ${#remotes[@]} -eq 0 ]]; then
+    run_cmd_yes "git fetch --all --prune"
+    return
+  fi
+
+  # Show remote information to help user choose
+  echo "${C_BOLD}Available Remotes:${C_RST}"
+  local i=1
+  for remote in "${remotes[@]}"; do
+    local url; url=$(git remote get-url "$remote" 2>/dev/null || echo "unknown")
+    echo "  $i) $remote ($url)"
+    ((i++))
+  done
+  echo ""
+
+  local remote
+  remote="$(choose_one "Select remote to fetch (or back)" "${remotes[@]}")" || return
+  [[ -z "$remote" ]] && return
+  local flags
+  flags="$(choose_multi_flags "Optional fetch flags" "--prune" "--tags")" || return
+  run_cmd_yes "git fetch ${flags} \"${remote}\""
+}
+
+wf_log() {
+  # Enhanced log with better commit selection
+  echo "${C_BOLD}Log Options:${C_RST}"
+  echo "1) Recent commits (last 20)      # 最近20条"
+  echo "2) All commits (full history)    # 全部历史"
+  echo "3) Custom range (specify range)  # 自定义范围"
+  echo "4) Current branch only           # 仅当前分支"
+  read -r -p "Choose log view [1]: " log_choice
+  log_choice="${log_choice:-1}"
+
+  local base_cmd="git log"
+
+  case "$log_choice" in
+    1) base_cmd="$base_cmd -20" ;;
+    2) ;; # no extra options, base_cmd already set to "git log"
+    3)
+      read -r -p "Enter range (e.g. HEAD~10..HEAD, main..feature): " range
+      if [[ -n "$range" ]]; then
+        # Validate range to prevent command injection
+        if [[ "$range" =~ ^[a-zA-Z0-9._/~^:\\-]+$ ]]; then
+          base_cmd="$base_cmd $range"
+        else
+          err "Invalid range: contains unsafe characters"
+          return 1
+        fi
+      fi
+      ;;
+    4)
+      local current; current=$(current_branch)
+      base_cmd="$base_cmd $current"
+      ;;
+  esac
+
+  local flags
+  flags="$(choose_multi_flags "Display options:" "--oneline" "--graph" "--decorate" "--stat" "--patch")" || return
+  [[ -n "$flags" ]] && base_cmd="$base_cmd $flags"
+
+  run_cmd_yes "$base_cmd"
+}
+
+wf_diff() {
+  local -a choices=()
+
+  # Add current branch options
+  local current; current=$(current_branch)
+  choices+=("Current HEAD vs Working Directory")
+  choices+=("Current HEAD vs Staged changes")
+
+  # Add branch comparison options
+  while IFS= read -r b; do [[ -n "$b" ]] && [[ "$b" != "$current" ]] && choices+=("Branch: $b (vs current)"); done < <(list_local_branches)
+  while IFS= read -r b; do [[ -n "$b" ]] && choices+=("Remote: $b (vs current)"); done < <(list_remote_branches_full)
+
+  # Add specific commit/file options
+  choices+=("Custom commit range")
+  choices+=("Specific file changes")
+
+  local pick
+  pick="$(choose_one "What do you want to diff?" "${choices[@]}")" || return
+  [[ -z "$pick" ]] && return
+
+  case "$pick" in
+    "Current HEAD vs Working Directory")
+      run_cmd_yes "git diff"
+      ;;
+    "Current HEAD vs Staged changes")
+      run_cmd_yes "git diff --cached"
+      ;;
+    "Branch: "*)
+      local branch="${pick#Branch: }"
+      branch="${branch% (vs current)}"
+      run_cmd_yes "git diff \"$branch\"..HEAD"
+      ;;
+    "Remote: "*)
+      local remote="${pick#Remote: }"
+      remote="${remote% (vs current)}"
+      run_cmd_yes "git diff \"$remote\"..HEAD"
+      ;;
+    "Custom commit range")
+      read -r -p "Enter commit range (e.g. HEAD~5..HEAD, commit1..commit2): " range
+      [[ -n "$range" ]] && run_cmd_yes "git diff \"$range\""
+      ;;
+    "Specific file changes")
+      local -a files=()
+      while IFS= read -r f; do files+=("$f"); done < <(git ls-files --modified 2>/dev/null)
+      if [[ ${#files[@]} -eq 0 ]]; then
+        warn "No modified files found."
+        return
+      fi
+      local file
+      file="$(choose_one "Select file to diff" "${files[@]}")" || return
+      run_cmd_yes "git diff -- \"$file\""
+      ;;
+  esac
+}
+
+wf_checkout() {
+  local mode
+  mode="$(choose_one "Checkout/Switch: choose source" "local branch" "remote branch" "new branch" "orphan branch")" || return
+  [[ -z "$mode" ]] && return
+
+  if [[ "$mode" == "local branch" ]]; then
+    local -a locals=()
+    while IFS= read -r b; do locals+=("$b"); done < <(list_local_branches)
+    local b
+    b="$(choose_one "Select LOCAL branch to switch" "${locals[@]}")" || return
+    [[ -z "$b" ]] && return
+    run_cmd "git switch \"${b}\""
+    return
+  fi
+
+  if [[ "$mode" == "remote branch" ]]; then
+    local -a rems=()
+    while IFS= read -r b; do rems+=("$b"); done < <(list_remote_branches_full)
+    if [[ ${#rems[@]} -eq 0 ]]; then
+      warn "No remote branches found. Try fetch first."
+      return
+    fi
+    local rb
+    rb="$(choose_one "Select REMOTE branch (e.g. origin/main)" "${rems[@]}")" || return
+    [[ -z "$rb" ]] && return
+
+    local default_local="${rb#*/}"  # origin/xxx -> xxx
+    read -r -p "Create local tracking branch name [${default_local}]: " user_input
+    local local_name="${user_input:-$default_local}"
+    [[ -z "$local_name" ]] && { warn "Empty branch name."; return; }
+
+    # Validate branch name
+    if [[ "$local_name" =~ [^a-zA-Z0-9_/-] ]] || [[ "$local_name" =~ ^[/-]|[/]$ ]] || [[ "$local_name" =~ \.\.|@ ]]; then
+      err "Invalid branch name: can only contain letters, numbers, underscores, hyphens and forward slashes"
+      return 1
+    fi
+
+    run_cmd "git switch -c \"${local_name}\" --track \"${rb}\""
+    return
+  fi
+
+  if [[ "$mode" == "new branch" ]]; then
+    require_clean_worktree_or_confirm || return
+    local -a locals=()
+    while IFS= read -r b; do locals+=("$b"); done < <(list_local_branches)
+    local base
+    base="$(choose_one "Select base branch (new branch from)" "${locals[@]}")" || return
+    [[ -z "$base" ]] && return
+    read -r -p "New branch name: " newb
+    [[ -z "$newb" ]] && { warn "Empty name."; return; }
+
+    # Validate branch name
+    if [[ "$newb" =~ [^a-zA-Z0-9_/-] ]] || [[ "$newb" =~ ^[/-]|[/]$ ]] || [[ "$newb" =~ \.\.|@ ]]; then
+      err "Invalid branch name: can only contain letters, numbers, underscores, hyphens and forward slashes"
+      return 1
+    fi
+
+    run_cmd "git switch \"${base}\" && git switch -c \"${newb}\""
+    return
+  fi
+
+  if [[ "$mode" == "orphan branch" ]]; then
+    require_clean_worktree_or_confirm || return
+    read -r -p "New orphan branch name: " newb
+    [[ -z "$newb" ]] && { warn "Empty name."; return; }
+
+    # Validate branch name
+    if [[ "$newb" =~ [^a-zA-Z0-9_/-] ]] || [[ "$newb" =~ ^[/-]|[/]$ ]] || [[ "$newb" =~ \.\.|@ ]]; then
+      err "Invalid branch name: can only contain letters, numbers, underscores, hyphens and forward slashes"
+      return 1
+    fi
+
+    run_cmd "git switch --orphan \"$newb\""
+    return
+  fi
+}
+
+wf_merge() {
+  require_clean_worktree_or_confirm || return
+
+  local -a locals=()
+  while IFS= read -r b; do locals+=("$b"); done < <(list_local_branches)
+
+  local target source
+  target="$(choose_one "Select TARGET branch (receive changes)" "${locals[@]}")" || return
+  [[ -z "$target" ]] && return
+  source="$(choose_one "Select SOURCE branch (merge into target)" "${locals[@]}")" || return
+  [[ -z "$source" ]] && return
+  if [[ "$target" == "$source" ]]; then
+    warn "TARGET == SOURCE, abort."
+    return
+  fi
+
+  # Show what will be merged
+  echo "${C_BOLD}Merge Summary:${C_RST}"
+  echo "Will merge '$source' into '$target'"
+  echo ""
+  echo "Commits that will be merged:"
+  git log --oneline "$target..$source" 2>/dev/null || echo "No commits to merge (fast-forward possible)"
+  echo ""
+
+  local flags
+  flags="$(choose_multi_flags "Merge options:" "--no-ff" "--ff-only" "--squash" "--no-commit" "--log")" || return
+
+  echo ""
+  info "Plan: switch to '${target}', then merge '${source}'"
+  run_cmd "git switch \"${target}\" && git merge ${flags} \"${source}\""
+
+  # If merge succeeded and not canceled, prompt deletion
+  if [[ "$DRY_RUN" != "1" ]]; then
+    # If merge had conflicts, git merge exits non-zero and script would have stopped.
+    post_delete_branch_prompt "${source}"
+  else
+    warn "DRY_RUN=1: skip post-merge delete prompt."
+  fi
+}
+
+wf_rebase() {
+  require_clean_worktree_or_confirm || return
+
+  local -a locals=()
+  while IFS= read -r b; do locals+=("$b"); done < <(list_local_branches)
+
+  local work onto
+  work="$(choose_one "Select WORK branch (to be rebased)" "${locals[@]}")" || return
+  [[ -z "$work" ]] && return
+  onto="$(choose_one "Select ONTO branch (new base)" "${locals[@]}")" || return
+  [[ -z "$onto" ]] && return
+  if [[ "$work" == "$onto" ]]; then
+    warn "WORK == ONTO, abort."
+    return
+  fi
+
+  # Show what will be rebased
+  echo "${C_BOLD}Rebase Summary:${C_RST}"
+  echo "Will rebase '$work' onto '$onto'"
+  echo ""
+  echo "Commits that will be rebased:"
+  git log --oneline "$onto..$work" 2>/dev/null || echo "No commits to rebase"
+  echo ""
+
+  local flags
+  flags="$(choose_multi_flags "Rebase options:" "--interactive" "--autosquash" "--rebase-merges" "--keep-empty")" || return
+
+  echo ""
+  info "Plan: switch to '${work}', rebase onto '${onto}'"
+  run_cmd "git switch \"${work}\" && git rebase ${flags} \"${onto}\""
+
+  # Rebase usually keeps branch (work) as your working branch; ask delete only if user rebased some temp branch.
+  if [[ "$DRY_RUN" != "1" ]]; then
+    # Many people rebase feature onto main; you probably DON'T want to delete it immediately.
+    # So we ask an extra question.
+    if confirm "Rebase done. Do you want to delete branch '${work}' now? (usually NO unless it's a temp branch)"; then
+      post_delete_branch_prompt "${work}"
+    fi
+  else
+    warn "DRY_RUN=1: skip post-rebase delete prompt."
+  fi
+}
+
+wf_pull() {
+  local -a remotes=()
+  while IFS= read -r r; do remotes+=("$r"); done < <(list_remotes)
+  local remote
+  remote="$(choose_one "Select remote" "${remotes[@]}")" || return
+  [[ -z "$remote" ]] && return
+
+  # Get available branches for this remote
+  local -a rbranches=()
+  while IFS= read -r b; do
+    [[ "$b" == "${remote}/"* ]] && rbranches+=("${b#"${remote}"/}")
+  done < <(list_remote_branches_full)
+
+  if [[ ${#rbranches[@]} -eq 0 ]]; then
+    warn "No remote branches found for ${remote}. Try fetch first."
+    return
+  fi
+
+  # Show current tracking info if available
+  local current tracking
+  current=$(current_branch)
+  tracking=$(git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null || echo "")
+  if [[ -n "$tracking" ]]; then
+    echo "${C_BOLD}Current tracking:${C_RST} $tracking"
+    echo ""
+  fi
+
+  local br
+  br="$(choose_one "Select remote branch to pull" "${rbranches[@]}")" || return
+  [[ -z "$br" ]] && return
+
+  local flags
+  flags="$(choose_multi_flags "Pull options:" "--rebase" "--ff-only" "--no-rebase" "--tags")" || return
+  run_cmd "git pull ${flags} \"${remote}\" \"${br}\""
+}
+
+wf_push() {
+  local -a remotes=()
+  while IFS= read -r r; do remotes+=("$r"); done < <(list_remotes)
+  local remote
+  remote="$(choose_one "Select remote" "${remotes[@]}")" || return
+  [[ -z "$remote" ]] && return
+
+  local -a locals=()
+  while IFS= read -r b; do locals+=("$b"); done < <(list_local_branches)
+
+  # Show push status for each branch
+  echo "${C_BOLD}Push Status:${C_RST}"
+  for branch in "${locals[@]}"; do
+    local ahead behind status
+    ahead=$(git rev-list --count "${branch}@{u}..${branch}" 2>/dev/null || echo "?")
+    behind=$(git rev-list --count "${branch}..${branch}@{u}" 2>/dev/null || echo "?")
+    status="$ahead ahead, $behind behind"
+    [[ "$ahead" == "?" ]] && status="no tracking"
+    echo "  $branch: $status"
+  done
+  echo ""
+
+  local br
+  br="$(choose_one "Select local branch to push" "${locals[@]}")" || return
+  [[ -z "$br" ]] && return
+
+  # Check if remote branch exists
+  local remote_exists=false
+  if git show-ref --verify --quiet "refs/remotes/${remote}/${br}" 2>/dev/null; then
+    remote_exists=true
+    echo "${C_BOLD}Remote branch exists:${C_RST} ${remote}/${br}"
+  else
+    echo "${C_BOLD}Remote branch does not exist:${C_RST} ${remote}/${br} (new branch)"
+  fi
+
+  local flags
+  flags="$(choose_multi_flags "Push options:" "-u" "--force-with-lease" "--force" "--tags" "--delete")" || return
+
+  # Handle delete option separately
+  if [[ "$flags" == *" --delete"* ]]; then
+    flags="${flags//--delete/}"
+    if confirm "Delete remote branch '${remote}/${br}'?"; then
+      run_cmd "git push \"${remote}\" --delete \"${br}\""
+    fi
+    return
+  fi
+
+  run_cmd "git push ${flags} \"${remote}\" \"${br}\""
+}
+
+wf_stash() {
+  while true; do
+    echo ""
+    echo "${C_BOLD}Stash Menu${C_RST}"
+    echo "  1) stash save (push)                       # 暂存当前修改"
+    echo "  2) stash list                              # 查看暂存列表"
+    echo "  3) stash pop                               # 弹出最近暂存"
+    echo "  4) stash apply                             # 应用暂存(不删除)"
+    echo "  5) stash drop                              # 删除暂存"
+    echo "  6) stash show                              # 查看暂存内容"
+    echo "  7) stash branch (create branch from stash)     # 从暂存创建分支"
+    echo "  b) back                                    # 返回主菜单"
+    read -r -p "Choose: " c
+    case "$c" in
+      1)
+        read -r -p "Message (optional): " msg
+        if [[ -n "$msg" ]]; then
+          run_cmd "git stash push -m \"${msg//\"/\\\"}\""
+        else
+          run_cmd "git stash push"
+        fi
+        ;;
+      2) run_cmd_yes "git stash list";;
+      3)
+        local -a st=()
+        while IFS= read -r s; do st+=("$s"); done < <(list_stashes)
+        if [[ ${#st[@]} -eq 0 ]]; then warn "No stashes."; continue; fi
+        local pick
+        pick="$(choose_one "Select stash to pop" "${st[@]}")" || continue
+        [[ -z "$pick" ]] && continue
+        local ref="${pick%%:*}"
+        run_cmd "git stash pop ${ref}"
+        ;;
+      4)
+        local -a st2=()
+        while IFS= read -r s; do st2+=("$s"); done < <(list_stashes)
+        if [[ ${#st2[@]} -eq 0 ]]; then warn "No stashes."; continue; fi
+        local pick2
+        pick2="$(choose_one "Select stash to apply" "${st2[@]}")" || continue
+        [[ -z "$pick2" ]] && continue
+        local ref2="${pick2%%:*}"
+        run_cmd "git stash apply ${ref2}"
+        ;;
+      5)
+        local -a st3=()
+        while IFS= read -r s; do st3+=("$s"); done < <(list_stashes)
+        if [[ ${#st3[@]} -eq 0 ]]; then warn "No stashes."; continue; fi
+        local pick3
+        pick3="$(choose_one "Select stash to drop" "${st3[@]}")" || continue
+        [[ -z "$pick3" ]] && continue
+        local ref3="${pick3%%:*}"
+        run_cmd "git stash drop ${ref3}"
+        ;;
+      6)
+        local -a st4=()
+        while IFS= read -r s; do st4+=("$s"); done < <(list_stashes)
+        if [[ ${#st4[@]} -eq 0 ]]; then warn "No stashes."; continue; fi
+        local pick4
+        pick4="$(choose_one "Select stash to show" "${st4[@]}")" || continue
+        [[ -z "$pick4" ]] && continue
+        local ref4="${pick4%%:*}"
+        local show_flags
+        show_flags="$(choose_multi_flags "Show options:" "--stat" "--patch")" || continue
+        run_cmd_yes "git stash show ${show_flags} ${ref4}"
+        ;;
+      7)
+        local -a st5=()
+        while IFS= read -r s; do st5+=("$s"); done < <(list_stashes)
+        if [[ ${#st5[@]} -eq 0 ]]; then warn "No stashes."; continue; fi
+        local pick5
+        pick5="$(choose_one "Select stash for branch" "${st5[@]}")" || continue
+        [[ -z "$pick5" ]] && continue
+        local ref5="${pick5%%:*}"
+        read -r -p "Branch name from stash: " branch_name
+        [[ -z "$branch_name" ]] && { warn "Empty branch name."; continue; }
+        run_cmd "git stash branch \"$branch_name\" ${ref5}"
+        ;;
+      b|B) return;;
+      *) echo "Invalid.";;
+    esac
+  done
+}
+
+wf_tag() {
+  while true; do
+    echo ""
+    echo "${C_BOLD}Tag Menu${C_RST}"
+    echo "  1) list tags              # 列出所有标签"
+    echo "  2) create tag             # 创建轻量标签"
+    echo "  3) delete local tag       # 删除本地标签"
+    echo "  4) push tag(s)            # 推送标签到远程"
+    echo "  5) create annotated tag   # 创建附注标签"
+    echo "  6) verify tag             # 验证标签签名"
+    echo "  b) back                   # 返回主菜单"
+    read -r -p "Choose: " c
+    case "$c" in
+      1) run_cmd_yes "git tag --list";;
+      2)
+        read -r -p "Tag name: " t
+        [[ -z "$t" ]] && { warn "Empty tag name."; continue; }
+
+        # Validate tag name (similar to git's rules)
+        if [[ "$t" =~ [^a-zA-Z0-9._/-] ]] || [[ "$t" =~ ^[.-]|[.-]$ ]] || [[ "$t" =~ \.\.|@\{ ]]; then
+          err "Invalid tag name: cannot contain spaces, control characters, or start/end with . or -"
+          continue
+        fi
+
+        # Show recent commits for reference
+        echo "${C_BOLD}Recent commits for reference:${C_RST}"
+        git log --oneline -10
+        echo ""
+
+        read -r -p "Target commit (empty = HEAD): " commit
+        # Validate commit reference if provided
+        if [[ -n "$commit" ]] && ! git rev-parse --verify --quiet "$commit" >/dev/null 2>&1; then
+          err "Invalid commit reference: ${commit}"
+          continue
+        fi
+
+        if [[ -n "$commit" ]]; then
+          run_cmd "git tag \"${t}\" \"${commit}\""
+        else
+          run_cmd "git tag \"${t}\""
+        fi
+        ;;
+      3)
+        local -a tags=()
+        while IFS= read -r tag_item; do tags+=("$tag_item"); done < <(list_tags)
+        [[ ${#tags[@]} -eq 0 ]] && { warn "No tags."; continue; }
+        local pick
+        pick="$(choose_one "Select tag to delete" "${tags[@]}")" || continue
+        [[ -z "$pick" ]] && continue
+        run_cmd "git tag -d \"${pick}\""
+        ;;
+      4)
+        local -a remotes=()
+        while IFS= read -r r; do remotes+=("$r"); done < <(list_remotes)
+        local remote
+        remote="$(choose_one "Select remote" "${remotes[@]}")" || continue
+        [[ -z "$remote" ]] && continue
+
+        local -a tags2=()
+        while IFS= read -r tag_item2; do tags2+=("$tag_item2"); done < <(list_tags)
+        [[ ${#tags2[@]} -eq 0 ]] && { warn "No tags."; continue; }
+        tags2+=("--- ALL TAGS ---")
+        local pick2
+        pick2="$(choose_one "Select tag to push" "${tags2[@]}")" || continue
+        if [[ "$pick2" == "--- ALL TAGS ---" ]]; then
+          if confirm "Push ALL tags to ${remote}?"; then
+            run_cmd "git push \"${remote}\" --tags"
+          fi
+        else
+          run_cmd "git push \"${remote}\" \"${pick2}\""
+        fi
+        ;;
+      5)
+        read -r -p "Annotated tag name: " t
+        [[ -z "$t" ]] && { warn "Empty tag name."; continue; }
+
+        # Validate tag name
+        if [[ "$t" =~ [^a-zA-Z0-9._/-] ]] || [[ "$t" =~ ^[.-]|[.-]$ ]] || [[ "$t" =~ \.\.|@\{ ]]; then
+          err "Invalid tag name: cannot contain spaces, control characters, or start/end with . or -"
+          continue
+        fi
+
+        read -r -p "Tag message: " msg
+        [[ -z "$msg" ]] && { warn "Empty message for annotated tag."; continue; }
+
+        echo "${C_BOLD}Recent commits for reference:${C_RST}"
+        git log --oneline -10
+        echo ""
+
+        read -r -p "Target commit (empty = HEAD): " commit
+        if [[ -n "$commit" ]] && ! git rev-parse --verify --quiet "$commit" >/dev/null 2>&1; then
+          err "Invalid commit reference: ${commit}"
+          continue
+        fi
+
+        if [[ -n "$commit" ]]; then
+          run_cmd "git tag -a \"${t}\" \"${commit}\" -m \"${msg}\""
+        else
+          run_cmd "git tag -a \"${t}\" -m \"${msg}\""
+        fi
+        ;;
+      6)
+        local -a tags=()
+        while IFS= read -r tag_item; do tags+=("$tag_item"); done < <(list_tags)
+        [[ ${#tags[@]} -eq 0 ]] && { warn "No tags."; continue; }
+        local pick
+        pick="$(choose_one "Select tag to verify" "${tags[@]}")" || continue
+        [[ -z "$pick" ]] && continue
+        run_cmd_yes "git tag -v \"${pick}\""
+        ;;
+      b|B) return;;
+      *) echo "Invalid.";;
+    esac
+  done
+}
+
+wf_reset() {
+  local -a modes=("soft" "mixed" "hard")
+  local mode
+  mode="$(choose_one "Select reset mode" "${modes[@]}")" || return
+  [[ -z "$mode" ]] && return
+
+  # Show current status and recent commits
+  echo "${C_BOLD}Current Status:${C_RST}"
+  git status --short 2>/dev/null || echo "Working tree clean"
+  echo ""
+  echo "${C_BOLD}Recent commits:${C_RST}"
+  git log --oneline -10
+  echo ""
+
+  # Enhanced target selection
+  echo "${C_BOLD}Reset target options:${C_RST}"
+  echo "1) HEAD~1 (previous commit)                     # 后退1个提交"
+  echo "2) HEAD~5, HEAD~10, etc. (specify number)      # 后退N个提交"
+  echo "3) Specific commit hash                         # 指定commit"
+  echo "4) Branch name                                  # 重置到某分支"
+  echo "5) Custom reference                             # 自定义引用"
+  read -r -p "Choose target type [1]: " target_type
+  target_type="${target_type:-1}"
+
+  local tgt=""
+  case "$target_type" in
+    1) tgt="HEAD~1" ;;
+    2)
+      read -r -p "Number of commits to go back: " num
+      [[ "$num" =~ ^[0-9]+$ ]] || { err "Invalid number."; return 1; }
+      tgt="HEAD~$num"
+      ;;
+    3)
+      read -r -p "Commit hash: " hash
+      if ! git rev-parse --verify --quiet "$hash" >/dev/null 2>&1; then
+        err "Invalid commit hash: $hash"
+        return 1
+      fi
+      tgt="$hash"
+      ;;
+    4)
+      local -a branches=()
+      while IFS= read -r b; do branches+=("$b"); done < <(list_local_branches)
+      tgt="$(choose_one "Select branch" "${branches[@]}")" || return
+      ;;
+    5)
+      read -r -p "Custom reference (e.g. HEAD~3, tagname, etc.): " tgt
+      ;;
+  esac
+
+  [[ -z "$tgt" ]] && { err "No target specified."; return 1; }
+
+  warn "reset ${mode} will change local history (${mode} reset may lose changes)."
+  if [[ "$mode" == "hard" ]]; then
+    warn "⚠️  HARD RESET: This will DISCARD all local changes!"
+    if ! confirm "Are you absolutely sure you want to proceed with hard reset?"; then
+      return 1
+    fi
+  fi
+
+  run_cmd "git reset --${mode} \"${tgt}\""
+}
+
+wf_clean() {
+  warn "clean will delete untracked files/directories (use with caution)."
+
+  # First show what would be deleted
+  echo "${C_BOLD}Files that would be deleted:${C_RST}"
+  git clean -n 2>/dev/null || echo "No untracked files to clean"
+  echo ""
+
+  local flags
+  flags="$(choose_multi_flags "Clean options:" "-n" "-f" "-fd" "-fxd" "-X")" || return
+  [[ -z "$flags" ]] && { warn "No flags selected. Tip: use -n for preview."; return; }
+
+  if [[ "$flags" != *"-n"* ]]; then
+    warn "This will permanently delete files. No undo possible."
+    if ! confirm "Proceed with clean operation?"; then
+      return 1
+    fi
+  fi
+
+  run_cmd "git clean ${flags}"
+}
+
+wf_delete_branch() {
+  local mode
+  mode="$(choose_one "Delete branch: choose scope" "local" "remote" "local + remote")" || return
+  [[ -z "$mode" ]] && return
+
+  if [[ "$mode" == "local" || "$mode" == "local + remote" ]]; then
+    local -a locals=()
+    while IFS= read -r b; do locals+=("$b"); done < <(list_local_branches)
+
+    if [[ ${#locals[@]} -eq 0 ]]; then
+      warn "No local branches found."
+      return
+    fi
+
+    # Show branch status to help user decide
+    echo "${C_BOLD}Local Branches Status:${C_RST}"
+    local current; current=$(current_branch)
+    for branch in "${locals[@]}"; do
+      if [[ "$branch" == "$current" ]]; then
+        echo "  * $branch (current, cannot delete)"
+      else
+        local ahead behind tracking
+        ahead=$(git rev-list --count "${branch}@{u}..${branch}" 2>/dev/null || echo "?")
+        behind=$(git rev-list --count "${branch}..${branch}@{u}" 2>/dev/null || echo "?")
+        tracking="no tracking"
+        [[ "$ahead" != "?" ]] && tracking="$ahead ahead, $behind behind"
+        echo "  - $branch ($tracking)"
+      fi
+    done
+    echo ""
+
+    local b
+    b="$(choose_one "Select LOCAL branch to delete" "${locals[@]}")" || return
+    [[ -z "$b" ]] && return
+
+    if [[ "$b" == "$(current_branch)" ]]; then
+      err "Cannot delete current branch '${b}'. Switch to another branch first."
+      return
+    fi
+
+    # Show what will be lost if force delete
+    if ! git merge-base --is-ancestor "$b" "HEAD" 2>/dev/null; then
+      warn "Branch '$b' contains unmerged commits!"
+      git log --oneline "HEAD..$b" 2>/dev/null
+      if ! confirm "Branch '$b' has unmerged commits. Continue with force delete?"; then
+        return 1
+      fi
+    fi
+
+    local delmode
+    delmode="$(choose_one "Delete local branch '${b}' with:" "-d (safe, merged only)" "-D (force, unmerged allowed)")" || return
+    if [[ "$delmode" == "-D (force)" ]]; then
+      run_cmd "git branch -D \"${b}\""
+    else
+      run_cmd "git branch -d \"${b}\""
+    fi
+
+    if [[ "$mode" == "local + remote" ]]; then
+      local -a remotes=()
+      while IFS= read -r r; do remotes+=("$r"); done < <(list_remotes)
+      if [[ ${#remotes[@]} -eq 0 ]]; then
+        warn "No remotes found; skip remote delete."
+        return
+      fi
+
+      # Check if remote branch exists
+      local remote_exists=false
+      for remote in "${remotes[@]}"; do
+        if git show-ref --verify --quiet "refs/remotes/${remote}/${b}" 2>/dev/null; then
+          remote_exists=true
+          break
+        fi
+      done
+
+      if [[ "$remote_exists" == true ]]; then
+        if confirm "Remote branch '${b}' exists. Delete from remote too?"; then
+          local remote
+          remote="$(choose_one "Select remote to delete '${b}' from" "${remotes[@]}")" || return 0
+          [[ -z "$remote" ]] && return 0
+
+          warn "This will permanently delete remote branch '${remote}/${b}'."
+          if confirm "Proceed with remote deletion?"; then
+            run_cmd "git push \"${remote}\" --delete \"${b}\""
+          fi
+        fi
+      else
+        warn "No remote branch '${b}' found."
+      fi
+    fi
+    return
+  fi
+
+  if [[ "$mode" == "remote" ]]; then
+    local -a rems=()
+    while IFS= read -r b; do rems+=("$b"); done < <(list_remote_branches_full)
+    [[ ${#rems[@]} -eq 0 ]] && { warn "No remote branches found. fetch first."; return; }
+
+    # Show remote branch info
+    echo "${C_BOLD}Remote Branches:${C_RST}"
+    for rb in "${rems[@]}"; do
+      local remote="${rb%%/*}"
+      local name="${rb#*/}"
+      local last_commit; last_commit=$(git log -1 --format="%h %s" "$rb" 2>/dev/null || echo "unknown")
+      echo "  - $rb (${last_commit:0:50})"
+    done
+    echo ""
+
+    local rb
+    rb="$(choose_one "Select REMOTE branch to delete" "${rems[@]}")" || return
+    [[ -z "$rb" ]] && return
+    local remote="${rb%%/*}"
+    local name="${rb#*/}"
+
+    warn "This will delete remote branch '${remote}/${name}'."
+    warn "Remote deletion cannot be undone!"
+    if confirm "Proceed with remote deletion?"; then
+      run_cmd "git push \"${remote}\" --delete \"${name}\""
+    fi
+    return
+  fi
+}
+
+wf_delete_file() {
+  local mode
+  mode="$(choose_one "Delete file: choose mode" "normal delete (git rm)" "purge from history (git filter-repo)")" || return
+  [[ -z "$mode" ]] && return
+
+  # pick file: allow input or choose from tracked files
+  local pick_method
+  pick_method="$(choose_one "Select file input method" "choose from tracked files" "choose from modified files" "choose from untracked files" "type path manually")" || return
+  [[ -z "$pick_method" ]] && return
+
+  local path=""
+  if [[ "$pick_method" == "choose from tracked files" ]]; then
+    local -a files=()
+    while IFS= read -r f; do files+=("$f"); done < <(list_tracked_files)
+    if [[ ${#files[@]} -eq 0 ]]; then
+      warn "No tracked files."
+      return
+    fi
+    path="$(choose_one "Select file" "${files[@]}")" || return
+  elif [[ "$pick_method" == "choose from modified files" ]]; then
+    local -a files=()
+    while IFS= read -r f; do files+=("$f"); done < <(git ls-files --modified)
+    if [[ ${#files[@]} -eq 0 ]]; then
+      warn "No modified files."
+      return
+    fi
+    path="$(choose_one "Select modified file" "${files[@]}")" || return
+  elif [[ "$pick_method" == "choose from untracked files" ]]; then
+    local -a files=()
+    while IFS= read -r f; do files+=("$f"); done < <(list_untracked_files)
+    if [[ ${#files[@]} -eq 0 ]]; then
+      warn "No untracked files."
+      return
+    fi
+    path="$(choose_one "Select untracked file" "${files[@]}")" || return
+  else
+    read -r -p "File path (relative, e.g. secrets.txt): " path
+  fi
+  [[ -z "$path" ]] && { warn "Empty path."; return; }
+
+  # Validate file path - prevent directory traversal and special characters
+  if [[ "$path" =~ \.\./|\.\.\\/ ]] || [[ "$path" =~ ^[[:space:]]*$ ]]; then
+    err "Invalid file path: directory traversal not allowed"
+    return 1
+  fi
+
+  if [[ "$mode" == "normal delete (git rm)" ]]; then
+    # Show file status
+    echo "${C_BOLD}File status:${C_RST}"
+    if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+      echo "  $path is tracked"
+    else
+      echo "  $path is not tracked"
+      if [[ -f "$path" ]]; then
+        echo "  File exists on disk"
+      fi
+    fi
+    echo ""
+
+    require_clean_worktree_or_confirm || return
+    local flags
+    flags="$(choose_multi_flags "git rm options" "--cached (keep in working tree)" "-r (recursive)" "--ignore-unmatch")" || return
+    # normalize flags: remove descriptions in parentheses
+    flags="${flags//--cached (keep in working tree)/--cached}"
+    flags="${flags//-r (recursive)/-r}"
+    flags="${flags//--ignore-unmatch/--ignore-unmatch}"
+
+    if [[ -n "$flags" ]]; then
+      run_cmd "git rm ${flags} -- \"${path}\""
+    else
+      run_cmd "git rm -- \"${path}\""
+    fi
+    info "Next: commit the deletion."
+    return
+  fi
+
+  # purge from history
+  warn "🚨 COMPLETE DELETION WARNING:"
+  warn "This will rewrite git history and PERMANENTLY remove '${path}' from ALL commits."
+  warn "• All commit hashes will change"
+  warn "• Requires force push to remotes"
+  warn "• All collaborators must re-clone or reset"
+  warn ""
+  warn "This operation is IRREVERSIBLE!"
+  if ! confirm "I understand the risks. Continue with complete deletion?"; then
+    return
+  fi
+
+  if command -v git-filter-repo >/dev/null 2>&1; then
+    # best practice: operate on fresh clone; here we proceed in place with warning
+    warn "⚠️  Best practice: run on a fresh clone."
+    warn "⚠️  You're about to run this on the current repository."
+    if ! confirm "Proceed in this repository anyway?"; then
+      return
+    fi
+
+    # Show what will be affected
+    echo "${C_BOLD}Files affected:${C_RST}"
+    git log --name-only --pretty=format:"" -- "$path" | sort -u | sed '/^$/d'
+    echo ""
+
+    # Create safety tag
+    if confirm "Create a backup tag before rewrite?"; then
+      local ts
+      ts="$(date +%Y%m%d-%H%M%S)"
+      run_cmd "git tag gitcmd-backup-${ts}"
+    fi
+
+    run_cmd "git filter-repo --path \"${path}\" --invert-paths"
+    ok "History rewrite completed."
+
+    # Suggest remote force push (do not auto execute unless user confirms)
+    local -a remotes=()
+    while IFS= read -r r; do remotes+=("$r"); done < <(list_remotes)
+    if [[ ${#remotes[@]} -gt 0 ]]; then
+      warn "⚠️  History has been rewritten. Remotes need to be updated."
+      if confirm "Force-push rewritten history to remotes now?"; then
+        local remote
+        remote="$(choose_one "Select remote" "${remotes[@]}")" || return
+        [[ -z "$remote" ]] && return
+        warn "Will run: git push --force --all + git push --force --tags"
+        if confirm "Proceed force push to '${remote}'?"; then
+          run_cmd "git push \"${remote}\" --force --all && git push \"${remote}\" --force --tags"
+        fi
+      else
+        echo "${C_YLW}Remember to run:${C_RST}"
+        echo "  git push ${remotes[0]} --force --all"
+        echo "  git push ${remotes[0]} --force --tags"
+        echo "  git push ${remotes[0]} --delete ${path}"
+      fi
+    fi
+  else
+    warn "git-filter-repo not found."
+    echo ""
+    echo "${C_BOLD}Install options:${C_RST}"
+    echo "  macOS (Homebrew): brew install git-filter-repo"
+    echo "  Ubuntu/Debian:    apt-get install git-filter-repo   (or pipx/pip install git-filter-repo)"
+    echo ""
+    echo "${C_BOLD}After install, run:${C_RST}"
+    echo "  git filter-repo --path \"${path}\" --invert-paths"
+    echo ""
+    echo "${C_BOLD}Then (if you have remote):${C_RST}"
+    echo "  git push origin --force --all"
+    echo "  git push origin --force --tags"
+  fi
+}
+
+# ---------------- main menu ----------------
+main_menu() {
+  require_git_repo
+  local repo
+  repo="$(git rev-parse --show-toplevel)"
+  local br
+  br="$(current_branch)"
+
+  echo "${C_BOLD}gitcmd${C_RST} - interactive git helper"
+  echo "Repo : ${repo}"
+  echo "Branch: ${br}"
+  echo "Tip  : export DRY_RUN=1 to preview commands only"
+  echo ""
+
+  while true; do
+    br="$(current_branch)"
+    echo ""
+    echo "${C_BOLD}Main Menu${C_RST}  ${C_DIM}(current: ${br})${C_RST}"
+    echo "  1) status                              # 查看工作区状态"
+    echo "  2) fetch                               # 从远程获取更新"
+    echo "  3) log                                 # 查看提交历史"
+    echo "  4) diff (target..HEAD)                 # 对比差异"
+    echo "  5) checkout/switch                     # 切换/创建分支"
+    echo "  6) merge                               # 合并分支"
+    echo "  7) rebase                              # 变基操作"
+    echo "  8) pull                                # 拉取远程更新"
+    echo "  9) push                                # 推送到远程"
+    echo " 10) stash                               # 暂存管理"
+    echo " 11) tag                                 # 标签管理"
+    echo " 12) delete branch (local/remote)        # 删除分支"
+    echo " 13) delete file (normal/purge history)  # 删除文件"
+    echo " 14) reset                               # 重置HEAD"
+    echo " 15) clean (danger)                      # 清理未跟踪文件"
+    echo " h) help                                 # 帮助信息"
+    echo " q) quit                                 # 退出"
+    read -r -p "Choose: " c
+    case "$c" in
+      1) wf_status;;
+      2) wf_fetch;;
+      3) wf_log;;
+      4) wf_diff;;
+      5) wf_checkout;;
+      6) wf_merge;;
+      7) wf_rebase;;
+      8) wf_pull;;
+      9) wf_push;;
+      10) wf_stash;;
+      11) wf_tag;;
+      12) wf_delete_branch;;
+      13) wf_delete_file;;
+      14) wf_reset;;
+      15) wf_clean;;
+      h|H) print_help; pause;;
+      q|Q) exit 0;;
+      *) echo "Invalid.";;
+    esac
+  done
+}
+
+# Only run main_menu if script is executed directly (not sourced)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main_menu
+fi
